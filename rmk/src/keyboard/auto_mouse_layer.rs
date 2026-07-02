@@ -40,7 +40,8 @@ pub fn run_auto_mouse_layer_if_enabled<'a, 'k>(keymap: &'a KeyMap<'k>) -> AutoMo
 #[derive(Clone, Copy)]
 struct EntryState {
     config: AutoMouseLayerConfig,
-    /// `true` while this entry is the one holding the layer on.
+    /// `true` while this entry is holding the layer active. Multiple entries
+    /// may hold the same layer simultaneously when they share `target_layer`.
     self_activated: bool,
     /// Set when the entry is self-activated; the layer is deactivated when this
     /// time is reached unless further motion pushes the deadline forward.
@@ -48,6 +49,13 @@ struct EntryState {
     /// Whether we have already warned about the entry's layer overlapping a
     /// manually-activated layer.
     overlap_warned: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PointingOutcome {
+    Holding,
+    OverlapFirstSeen,
+    Idle,
 }
 
 impl Runnable for AutoMouseLayerRunner<'_, '_> {
@@ -105,18 +113,8 @@ impl Runnable for AutoMouseLayerRunner<'_, '_> {
             match next {
                 Tick::Timeout => {
                     let now = Instant::now();
-                    // Only release the layer once no other entry still holds it.
-                    for i in 0..entries.len() {
-                        let expired = entries[i].self_activated && entries[i].deadline.is_some_and(|d| d <= now);
-                        if !expired {
-                            continue;
-                        }
-                        entries[i].self_activated = false;
-                        entries[i].deadline = None;
-                        let layer = entries[i].config.target_layer;
-                        if !layer_still_held(&entries, layer) {
-                            keymap.deactivate_layer_if_active(layer);
-                        }
+                    for layer in timeout_step(&mut entries, now) {
+                        keymap.deactivate_layer_if_active(layer);
                     }
                 }
                 Tick::Pointing(event) => {
@@ -126,33 +124,22 @@ impl Runnable for AutoMouseLayerRunner<'_, '_> {
                     if !is_cursor_motion(&event, entries[idx].config.threshold) {
                         continue;
                     }
-                    // Read shared state before the mutable borrow below.
                     let target_layer = entries[idx].config.target_layer;
-                    let shared_with_other = layer_shared_with_other(&entries, idx, target_layer);
-                    let entry = &mut entries[idx];
-                    if keymap.activate_layer_if_inactive(target_layer) {
-                        entry.self_activated = true;
-                        entry.overlap_warned = false;
-                    } else if shared_with_other {
-                        entry.self_activated = true;
-                        entry.overlap_warned = false;
-                    } else if !entry.self_activated && !entry.overlap_warned {
+                    let activated_by_us = keymap.activate_layer_if_inactive(target_layer);
+                    if pointing_step(&mut entries, idx, Instant::now(), activated_by_us)
+                        == PointingOutcome::OverlapFirstSeen
+                    {
                         warn!(
                             "auto_mouse_layer: layer {} is already active when motion was detected; \
                              the layer is likely driven by another key (MO/TG). The auto mouse layer \
                              will not be deactivated on timeout while overlap holds.",
                             target_layer
                         );
-                        entry.overlap_warned = true;
-                    }
-                    if entry.self_activated {
-                        entry.deadline = Some(Instant::now() + entry.config.timeout);
                     }
                 }
                 Tick::Layer(LayerChangeEvent(top)) => {
+                    // Layer turned off externally (MO/TG key etc.) — release our hold.
                     for entry in entries.iter_mut() {
-                        // Layer was turned off externally — clear our tracking state so the next
-                        // pointer motion can re-activate it without stale deadline data.
                         if entry.self_activated && !keymap.is_layer_active(entry.config.target_layer) {
                             entry.self_activated = false;
                             entry.deadline = None;
@@ -196,11 +183,49 @@ fn layer_still_held(entries: &[EntryState], layer: u8) -> bool {
         .any(|e| e.self_activated && e.config.target_layer == layer)
 }
 
+/// Whether some entry other than `idx` self-holds `layer`.
 fn layer_shared_with_other(entries: &[EntryState], idx: usize, layer: u8) -> bool {
     entries
         .iter()
         .enumerate()
         .any(|(i, e)| i != idx && e.self_activated && e.config.target_layer == layer)
+}
+
+fn timeout_step(entries: &mut [EntryState], now: Instant) -> Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> {
+    let mut released: Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> = Vec::new();
+    for i in 0..entries.len() {
+        let expired = entries[i].self_activated && entries[i].deadline.is_some_and(|d| d <= now);
+        if !expired {
+            continue;
+        }
+        entries[i].self_activated = false;
+        entries[i].deadline = None;
+        let layer = entries[i].config.target_layer;
+        if !layer_still_held(entries, layer) {
+            let _ = released.push(layer);
+        }
+    }
+    released
+}
+
+fn pointing_step(entries: &mut [EntryState], idx: usize, now: Instant, activated_by_us: bool) -> PointingOutcome {
+    let target_layer = entries[idx].config.target_layer;
+    let shared_with_other = layer_shared_with_other(entries, idx, target_layer);
+    let entry = &mut entries[idx];
+    if activated_by_us || shared_with_other {
+        entry.self_activated = true;
+        entry.overlap_warned = false;
+        entry.deadline = Some(now + entry.config.timeout);
+        PointingOutcome::Holding
+    } else if entry.self_activated {
+        entry.deadline = Some(now + entry.config.timeout);
+        PointingOutcome::Idle
+    } else if !entry.overlap_warned {
+        entry.overlap_warned = true;
+        PointingOutcome::OverlapFirstSeen
+    } else {
+        PointingOutcome::Idle
+    }
 }
 
 /// Only relative X/Y axis deltas count as cursor motion. Scroll-only events
@@ -382,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_shared_with_other_true_when_another_entry_holds_same_layer() {
+    fn layer_shared_with_other_true_when_another_self_activated_entry_holds_same_layer() {
         let entries = [active_entry(Some(1), 2), active_entry(Some(2), 2)];
         assert!(layer_shared_with_other(&entries, 0, 2));
     }
@@ -407,5 +432,169 @@ mod tests {
         let e = event_for(3, [axis(Axis::X, 5), axis(Axis::Y, 0), zero]);
         assert_eq!(e.device_id, 3);
         assert!(is_cursor_motion(&e, 1));
+    }
+
+    fn at(millis: u64) -> Instant {
+        Instant::from_millis(millis)
+    }
+
+    fn entry_with_layer(device_id: Option<u8>, target_layer: u8) -> EntryState {
+        let mut e = entry(device_id);
+        e.config.target_layer = target_layer;
+        e
+    }
+
+    #[test]
+    fn timeout_step_releases_layer_when_last_holder_expires() {
+        let mut entries = [entry_with_layer(Some(1), 3)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(100));
+
+        let released = timeout_step(&mut entries, at(150));
+
+        assert_eq!(released.as_slice(), &[3]);
+        assert!(!entries[0].self_activated);
+        assert!(entries[0].deadline.is_none());
+    }
+
+    #[test]
+    fn timeout_step_keeps_shared_layer_alive_while_a_sibling_still_holds_it() {
+        let mut entries = [entry_with_layer(Some(1), 2), entry_with_layer(Some(2), 2)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(50));
+        entries[1].self_activated = true;
+        entries[1].deadline = Some(at(500));
+
+        let released = timeout_step(&mut entries, at(100));
+
+        assert!(released.is_empty());
+        assert!(!entries[0].self_activated);
+        assert!(entries[0].deadline.is_none());
+        assert!(entries[1].self_activated);
+        assert_eq!(entries[1].deadline, Some(at(500)));
+    }
+
+    #[test]
+    fn timeout_step_releases_shared_layer_when_all_holders_expire_simultaneously() {
+        let mut entries = [entry_with_layer(Some(1), 4), entry_with_layer(Some(2), 4)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(50));
+        entries[1].self_activated = true;
+        entries[1].deadline = Some(at(80));
+
+        let released = timeout_step(&mut entries, at(100));
+
+        assert_eq!(released.as_slice(), &[4]);
+        assert!(!entries[0].self_activated);
+        assert!(!entries[1].self_activated);
+    }
+
+    #[test]
+    fn timeout_step_ignores_entries_that_are_not_self_activated() {
+        let mut entries = [entry_with_layer(Some(1), 1)];
+        entries[0].self_activated = false;
+        entries[0].deadline = Some(at(10));
+
+        let released = timeout_step(&mut entries, at(500));
+
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn pointing_step_holds_layer_when_activation_succeeds() {
+        let mut entries = [entry_with_layer(Some(1), 2)];
+
+        let outcome = pointing_step(&mut entries, 0, at(1000), true);
+
+        assert_eq!(outcome, PointingOutcome::Holding);
+        assert!(entries[0].self_activated);
+        assert_eq!(entries[0].deadline, Some(at(1000) + entries[0].config.timeout));
+        assert!(!entries[0].overlap_warned);
+    }
+
+    #[test]
+    fn pointing_step_piggybacks_on_a_sibling_that_already_holds_the_shared_layer() {
+        let mut entries = [entry_with_layer(Some(1), 2), entry_with_layer(Some(2), 2)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(500));
+
+        let outcome = pointing_step(&mut entries, 1, at(1000), false);
+
+        assert_eq!(outcome, PointingOutcome::Holding);
+        assert!(entries[1].self_activated);
+        assert_eq!(entries[1].deadline, Some(at(1000) + entries[1].config.timeout));
+        assert!(entries[0].self_activated);
+        assert_eq!(entries[0].deadline, Some(at(500)));
+    }
+
+    #[test]
+    fn pointing_step_warns_once_when_layer_is_externally_active() {
+        let mut entries = [entry_with_layer(Some(1), 2)];
+
+        let first = pointing_step(&mut entries, 0, at(1000), false);
+        assert_eq!(first, PointingOutcome::OverlapFirstSeen);
+        assert!(!entries[0].self_activated);
+        assert!(entries[0].deadline.is_none());
+        assert!(entries[0].overlap_warned);
+
+        let second = pointing_step(&mut entries, 0, at(1100), false);
+        assert_eq!(second, PointingOutcome::Idle);
+    }
+
+    #[test]
+    fn pointing_step_extends_deadline_on_repeated_motion_from_holding_entry() {
+        let mut entries = [entry_with_layer(Some(1), 3)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(200));
+
+        let outcome = pointing_step(&mut entries, 0, at(1000), false);
+
+        assert_eq!(outcome, PointingOutcome::Idle);
+        assert!(entries[0].self_activated);
+        assert_eq!(entries[0].deadline, Some(at(1000) + entries[0].config.timeout));
+    }
+
+    #[test]
+    fn pointing_step_resets_overlap_warned_when_we_regain_hold() {
+        let mut entries = [entry_with_layer(Some(1), 2)];
+
+        let first = pointing_step(&mut entries, 0, at(1000), false);
+        assert_eq!(first, PointingOutcome::OverlapFirstSeen);
+        assert!(entries[0].overlap_warned);
+
+        let second = pointing_step(&mut entries, 0, at(1100), true);
+        assert_eq!(second, PointingOutcome::Holding);
+        assert!(entries[0].self_activated);
+        assert!(!entries[0].overlap_warned);
+        assert_eq!(entries[0].deadline, Some(at(1100) + entries[0].config.timeout));
+    }
+
+    #[test]
+    fn timeout_step_releases_multiple_distinct_layers_that_expire_together() {
+        let mut entries = [entry_with_layer(Some(1), 3), entry_with_layer(Some(2), 5)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(100));
+        entries[1].self_activated = true;
+        entries[1].deadline = Some(at(150));
+
+        let released = timeout_step(&mut entries, at(200));
+
+        assert_eq!(released.len(), 2);
+        assert!(released.contains(&3));
+        assert!(released.contains(&5));
+        assert!(!entries[0].self_activated);
+        assert!(!entries[1].self_activated);
+    }
+
+    #[test]
+    fn timeout_step_expires_entry_when_deadline_equals_now() {
+        let mut entries = [entry_with_layer(Some(1), 3)];
+        entries[0].self_activated = true;
+        entries[0].deadline = Some(at(100));
+
+        let released = timeout_step(&mut entries, at(100));
+
+        assert_eq!(released.as_slice(), &[3]);
+        assert!(!entries[0].self_activated);
     }
 }
