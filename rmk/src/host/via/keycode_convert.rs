@@ -95,7 +95,7 @@ pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
                     0
                 }
             },
-            Action::User(id) => (id as u16 & 0xF) | 0x7E00,
+            Action::User(id) => (id as u16 & 0x1F) | 0x7E00,
             _ => {
                 warn!("Action: {:?} in vial is not supported yet", a);
                 0
@@ -245,9 +245,9 @@ pub(crate) fn from_via_keycode(via_keycode: u16) -> KeyAction {
             );
             KeyAction::No
         }
-        0x7E00..=0x7E0F => {
+        0x7E00..=0x7E1F => {
             // QK_KB_N, aka UserN
-            KeyAction::Single(Action::User(via_keycode as u8 & 0xF))
+            KeyAction::Single(Action::User(via_keycode as u8 & 0x1F))
         }
         _ => {
             warn!("Via keycode {:#X} is not processed", via_keycode);
@@ -277,6 +277,18 @@ mod test {
             KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::RShift))),
             from_via_keycode(via_keycode)
         );
+
+        // User0 (QK_KB_0)
+        let via_keycode = 0x7E00;
+        assert_eq!(KeyAction::Single(Action::User(0)), from_via_keycode(via_keycode));
+
+        // User16 (QK_KB_16) — must not alias to User0
+        let via_keycode = 0x7E10;
+        assert_eq!(KeyAction::Single(Action::User(16)), from_via_keycode(via_keycode));
+
+        // User31 (QK_KB_31)
+        let via_keycode = 0x7E1F;
+        assert_eq!(KeyAction::Single(Action::User(31)), from_via_keycode(via_keycode));
 
         // Mo(3)
         let via_keycode = 0x5223;
@@ -498,6 +510,18 @@ mod test {
         // Mo(3)
         let a = KeyAction::Single(Action::LayerOn(3));
         assert_eq!(0x5223, to_via_keycode(a));
+
+        // User0 (QK_KB_0)
+        let a = KeyAction::Single(Action::User(0));
+        assert_eq!(0x7E00, to_via_keycode(a));
+
+        // User16 (QK_KB_16) — must not alias to User0's 0x7E00
+        let a = KeyAction::Single(Action::User(16));
+        assert_eq!(0x7E10, to_via_keycode(a));
+
+        // User31 (QK_KB_31)
+        let a = KeyAction::Single(Action::User(31));
+        assert_eq!(0x7E1F, to_via_keycode(a));
 
         // OSL(3)
         let a = KeyAction::Single(Action::OneShotLayer(3));
