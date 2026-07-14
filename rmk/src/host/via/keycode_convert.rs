@@ -38,13 +38,7 @@ pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
                     0
                 }
             },
-            Action::KeyWithModifier(k, m) => {
-                if let KeyCode::Hid(hid_keycode) = k {
-                    ((m.into_packed_bits() as u16) << 8) | hid_keycode as u16
-                } else {
-                    0
-                }
-            }
+            Action::KeyWithModifier(k, m) => ((m.into_packed_bits() as u16) << 8) | k as u16,
             Action::LayerToggleOnly(l) => 0x5200 | l as u16,
             Action::LayerOn(l) => 0x5220 | l as u16,
             Action::DefaultLayer(l) => 0x5240 | l as u16,
@@ -145,10 +139,9 @@ pub(crate) fn from_via_keycode(via_keycode: u16) -> KeyAction {
         0x0001 => KeyAction::Transparent,
         0x0002..=0x00FF => KeyAction::Single(Action::Key(KeyCode::Hid((via_keycode as u8).into()))),
         0x0100..=0x1FFF => {
-            // WithModifier
-            let keycode = KeyCode::Hid((via_keycode as u8).into());
+            // WithModifier. Modifiers only apply to HID keyboard keys, so the key narrows to HidKeyCode.
             let modifier = ModifierCombination::from_packed_bits((via_keycode >> 8) as u8);
-            KeyAction::Single(Action::KeyWithModifier(keycode, modifier))
+            KeyAction::Single(Action::KeyWithModifier((via_keycode as u8).into(), modifier))
         }
         0x2000..=0x3FFF => {
             // Modifier tap-hold.
@@ -351,7 +344,7 @@ mod test {
         let via_keycode = 0x104;
         assert_eq!(
             KeyAction::Single(Action::KeyWithModifier(
-                KeyCode::Hid(HidKeyCode::A),
+                HidKeyCode::A,
                 ModifierCombination::new_from(false, false, false, false, true)
             )),
             from_via_keycode(via_keycode)
@@ -361,7 +354,7 @@ mod test {
         let via_keycode = 0x1104;
         assert_eq!(
             KeyAction::Single(Action::KeyWithModifier(
-                KeyCode::Hid(HidKeyCode::A),
+                HidKeyCode::A,
                 ModifierCombination::new_from(true, false, false, false, true)
             )),
             from_via_keycode(via_keycode)
@@ -371,7 +364,7 @@ mod test {
         let via_keycode = 0x704;
         assert_eq!(
             KeyAction::Single(Action::KeyWithModifier(
-                KeyCode::Hid(HidKeyCode::A),
+                HidKeyCode::A,
                 ModifierCombination::new_from(false, false, true, true, true)
             )),
             from_via_keycode(via_keycode)
@@ -381,7 +374,7 @@ mod test {
         let via_keycode = 0xF04;
         assert_eq!(
             KeyAction::Single(Action::KeyWithModifier(
-                KeyCode::Hid(HidKeyCode::A),
+                HidKeyCode::A,
                 ModifierCombination::new_from(false, true, true, true, true)
             )),
             from_via_keycode(via_keycode)
@@ -560,28 +553,28 @@ mod test {
 
         // LCtrl(A) -> WithModifier(A)
         let a = KeyAction::Single(Action::KeyWithModifier(
-            KeyCode::Hid(HidKeyCode::A),
+            HidKeyCode::A,
             ModifierCombination::new_from(false, false, false, false, true),
         ));
         assert_eq!(0x104, to_via_keycode(a));
 
         // RCtrl(A) -> WithModifier(A)
         let a = KeyAction::Single(Action::KeyWithModifier(
-            KeyCode::Hid(HidKeyCode::A),
+            HidKeyCode::A,
             ModifierCombination::new_from(true, false, false, false, true),
         ));
         assert_eq!(0x1104, to_via_keycode(a));
 
         // Meh(A) -> WithModifier(A)
         let a = KeyAction::Single(Action::KeyWithModifier(
-            KeyCode::Hid(HidKeyCode::A),
+            HidKeyCode::A,
             ModifierCombination::new_from(false, false, true, true, true),
         ));
         assert_eq!(0x704, to_via_keycode(a));
 
         // Hypr(A) -> WithModifier(A)
         let a = KeyAction::Single(Action::KeyWithModifier(
-            KeyCode::Hid(HidKeyCode::A),
+            HidKeyCode::A,
             ModifierCombination::new_from(false, true, true, true, true),
         ));
         assert_eq!(0xF04, to_via_keycode(a));
