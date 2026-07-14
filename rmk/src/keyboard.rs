@@ -1590,7 +1590,7 @@ impl<'a> Keyboard<'a> {
 
     /// Process consumer control action. Consumer control keys are keys in hid consumer page, such as media keys.
     async fn process_action_consumer_control(&mut self, key: ConsumerKey, event: KeyboardEvent) {
-        self.media_report.usage_id = if event.pressed { key as u16 } else { 0 };
+        self.media_report.usage_id = if event.pressed { key.into() } else { 0 };
 
         self.send_media_report().await;
     }
