@@ -272,10 +272,9 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
         server.host_service.input_data,
         server.host_service.hid_control_point,
     );
-    let mouse = server.composite_service.mouse_report;
-    let media = server.composite_service.media_report;
-    let media_control_point = server.composite_service.hid_control_point;
-    let system_control = server.composite_service.system_report;
+    let mouse = server.hid_service.mouse_report;
+    let media = server.hid_service.media_report;
+    let system_control = server.hid_service.system_report;
 
     #[cfg(feature = "passkey_entry")]
     let mut passkey_state = PasskeyInputState::new();
@@ -371,10 +370,7 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                             || event.handle() == level.cccd_handle.expect("No CCCD for battery level")
                         {
                             cccd_updated = true;
-                        } else if event.handle() == hid_control_point.handle
-                            || event.handle() == media_control_point.handle
-                            || host_control_point_match
-                        {
+                        } else if event.handle() == hid_control_point.handle || host_control_point_match {
                             info!("Write GATT Event to Control Point: {:?}", event.handle());
                             #[cfg(feature = "split")]
                             {
