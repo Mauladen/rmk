@@ -52,7 +52,7 @@ pub(crate) const L2CAP_CHANNELS_MAX: usize = CONNECTIONS_MAX * 4; // Signal + at
 pub async fn build_ble_stack<'a, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
     controller: C,
     host_address: [u8; 6],
-    resources: &'a mut HostResources<C, P, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
+    resources: &'a mut HostResources<P, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
 ) -> Stack<'a, C, P> {
     // Initialize trouble host stack
     trouble_host::new(controller, resources)
