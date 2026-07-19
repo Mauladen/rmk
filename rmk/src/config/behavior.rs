@@ -124,6 +124,9 @@ pub struct OneShotModifiersConfig {
     pub activate_on_keypress: bool,
     /// If true, OSM releases on next key press (ZMK skq); if false, on next key release (ZMK skn)
     pub quick_release: bool,
+    /// If true, activating a layer key (MO, TG, OSL, ...) while a one-shot modifier
+    /// is active cancels that modifier, so the layer's keys are used without it.
+    pub cancel_ossm_on_layer_enter: bool,
 }
 
 /// Config for combo behavior

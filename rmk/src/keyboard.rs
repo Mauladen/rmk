@@ -28,7 +28,7 @@ use crate::keyboard::combo::Combo;
 use crate::keyboard::fork::ActiveFork;
 use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState};
 use crate::keyboard::mouse::{MouseAction, MouseState};
-use crate::keyboard::oneshot::OneShotState;
+use crate::keyboard::oneshot::{OneShotState, OsmUpdate};
 use crate::keyboard_macros::MacroOperation;
 use crate::keymap::KeyMap;
 #[cfg(all(feature = "split", feature = "_ble"))]
@@ -207,6 +207,12 @@ pub struct Keyboard<'a> {
     /// Oneshot Modifier state
     osm_state: OneShotState<ModifierCombination>,
 
+    /// LatchTap state: a modifier latched by a `LatchTap` action and the layer
+    /// it was engaged on. The modifier stays engaged until that layer is
+    /// deactivated (see [`Keyboard::cleanup_latch_tap`]).
+    latched_modifiers: ModifierCombination,
+    latched_layer: Option<u8>,
+
     /// Caps Word state machine
     caps_word: CapsWordState,
 
@@ -260,6 +266,8 @@ impl<'a> Keyboard<'a> {
             last_press_time: Instant::now(),
             osl_state: OneShotState::default(),
             osm_state: OneShotState::default(),
+            latched_modifiers: ModifierCombination::default(),
+            latched_layer: None,
             caps_word: CapsWordState::default(),
             with_modifiers: ModifierCombination::default(),
             macro_texting: false,
@@ -377,6 +385,10 @@ impl<'a> Keyboard<'a> {
         } else {
             self.process_key_action(key_action, event, false, event_time).await
         }
+
+        // Release any latched LatchTap modifier whose layer was just deactivated
+        // (e.g. when the momentary layer key is released).
+        self.cleanup_latch_tap().await;
     }
 
     async fn process_key_action(
@@ -1221,15 +1233,12 @@ impl<'a> Keyboard<'a> {
             Action::Key(key) => match key {
                 KeyCode::Hid(hid) => self.process_action_key(hid, event).await,
                 // Consumer/system keys with no HID alias are dispatched directly here.
+                // One-shot post-processing is done once below for all actions.
                 KeyCode::Consumer(consumer) => {
                     self.process_action_consumer_control(consumer, event).await;
-                    self.update_osm(event);
-                    self.update_osl(event);
                 }
                 KeyCode::SystemControl(system_control) => {
                     self.process_action_system_control(system_control, event).await;
-                    self.update_osm(event);
-                    self.update_osl(event);
                 }
                 _ => warn!("KeyCode variant not supported: {:?}", key),
             },
@@ -1315,15 +1324,12 @@ impl<'a> Keyboard<'a> {
             }
             Action::OneShotLayer(l) => {
                 self.process_action_osl(l, event).await;
-                // Process OSM to avoid the OSL state stuck when an OSL is followed by an OSM
-                self.update_osm(event);
             }
             Action::OneShotModifier(m) => {
                 self.process_action_osm(m, event).await;
-                // Process OSL to avoid the OSM state stuck when an OSM is followed by an OSL
-                self.update_osl(event);
             }
             Action::OneShotKey(_k) => warn!("One-shot key is not supported: {:?}", action),
+            Action::LatchTap(modifiers, key) => self.process_action_latch_tap(modifiers, key, event).await,
             Action::Light(_light_action) => warn!("Light controll is not supported"),
             Action::KeyboardControl(c) => self.process_action_keyboard_control(c, event).await,
             Action::Special(special_key) => self.process_action_special(special_key, event).await,
@@ -1345,6 +1351,65 @@ impl<'a> Keyboard<'a> {
                 }
             }
             _ => warn!("Action variant not supported: {:?}", action),
+        }
+
+        // Update one-shot modifier/layer state for every processed action.
+        // `update_osm` also releases active one-shot modifiers when a layer key is
+        // activated while `behavior.one_shot_modifiers.cancel_ossm_on_layer_enter` is set.
+        //
+        // The one-shot modifier key itself is excluded from `update_osm`: its own
+        // press/release is already handled by `process_action_osm`, and calling
+        // `update_osm` here would prematurely consume the `Single` state (e.g. turn
+        // a normal one-shot into a held modifier, or release it on its own release).
+        // Symmetrically, the one-shot layer key itself is excluded from `update_osl`.
+        let os_config = self.keymap.one_shot_modifiers_config();
+        let quick_release = os_config.quick_release;
+        let activate_on_keypress = os_config.activate_on_keypress;
+        let osm_update = match action {
+            Action::OneShotModifier(_) => OsmUpdate::None,
+            _ => self.update_osm(event, action),
+        };
+        match osm_update {
+            OsmUpdate::Cancelled => {
+                // A configured release key cancelled an actively-held one-shot modifier.
+                // The modifier was being reported to the host (activate_on_keypress), so
+                // emit a release report to drop it from the host.
+                if activate_on_keypress {
+                    self.send_keyboard_report_with_resolved_modifiers(false).await;
+                } else {
+                    self.publish_modifier_ui_state();
+                }
+            }
+            OsmUpdate::Consumed => {
+                // Quick-release (skq): OSM is dropped on the *next key press*. The
+                // report for that press was already sent *with* OSM (state not
+                // cleared yet), so re-send without OSM so the host and UI match.
+                if quick_release && event.pressed {
+                    let basic_key = match action {
+                        Action::Key(KeyCode::Hid(k)) | Action::KeyWithModifier(k, _) => {
+                            k.is_simple_key()
+                        }
+                        Action::LatchTap(_, KeyCode::Hid(k)) => k.is_simple_key(),
+                        _ => false,
+                    };
+                    if basic_key {
+                        self.send_keyboard_report_with_resolved_modifiers(true).await;
+                    } else {
+                        self.publish_modifier_ui_state();
+                    }
+                } else {
+                    // Chain mode (skn, default): OSM is dropped on the *next key
+                    // release*. HID already omits OSM on that release report, but
+                    // `publish_modifier_ui_state` ran *before* `update_osm` cleared
+                    // the state — so chips stayed lit. Refresh UI now that OSM is gone.
+                    self.publish_modifier_ui_state();
+                }
+            }
+            _ => (),
+        }
+        match action {
+            Action::OneShotLayer(_) => (),
+            _ => self.update_osl(event),
         }
     }
 
@@ -1376,7 +1441,7 @@ impl<'a> Keyboard<'a> {
     /// - one-shot modifiers
     pub fn resolve_explicit_modifiers(&self, pressed: bool) -> ModifierCombination {
         // if a one-shot modifier is active, decorate the hid report of keypress with those modifiers
-        let mut result = self.held_modifiers;
+        let mut result = self.held_modifiers | self.latched_modifiers;
 
         // OneShotState::Held keeps the temporary modifiers active until the key is released
         if pressed {
@@ -1564,28 +1629,18 @@ impl<'a> Keyboard<'a> {
             self.caps_word.check(key);
         }
 
-        // Dispatch to the right HID report; only the plain-keyboard branch is "basic".
-        let is_basic_keyboard_key = if let Some(consumer) = key.process_as_consumer() {
+        // Dispatch to the right HID report.
+        // One-shot consume/update is handled in `process_key_action_normal` after
+        // the action match (so OSM/LatchTap UI state stays consistent).
+        if let Some(consumer) = key.process_as_consumer() {
             self.process_action_consumer_control(consumer, event).await;
-            false
         } else if let Some(system_control) = key.process_as_system_control() {
             self.process_action_system_control(system_control, event).await;
-            false
         } else if key.is_mouse_key() {
             self.process_action_mouse(key, event).await;
-            false
         } else {
             self.process_hid_keycode(key, event).await;
-            true
-        };
-
-        // Consume any pending one-shot; on quick-release of a basic key, re-send the report.
-        let quick_release = self.keymap.one_shot_modifiers_config().quick_release;
-        let osm_consumed = self.update_osm(event);
-        if quick_release && osm_consumed && is_basic_keyboard_key && event.pressed {
-            self.send_keyboard_report_with_resolved_modifiers(true).await;
         }
-        self.update_osl(event);
     }
 
     /// Process layer switch action.
@@ -1595,6 +1650,47 @@ impl<'a> Keyboard<'a> {
             self.keymap.activate_layer(layer_num);
         } else {
             self.keymap.deactivate_layer(layer_num);
+        }
+    }
+
+    /// Process a `LatchTap` action: latch a modifier for the lifetime of the
+    /// current layer and tap `key` under it on each press.
+    ///
+    /// On press the modifier is engaged (or extended) and the key is sent
+    /// together with it. On release the key is released while the modifier
+    /// stays latched. The latched modifier is released by
+    /// [`Keyboard::cleanup_latch_tap`] when the layer is deactivated.
+    async fn process_action_latch_tap(
+        &mut self,
+        modifiers: ModifierCombination,
+        key: KeyCode,
+        event: KeyboardEvent,
+    ) {
+        if event.pressed {
+            self.latched_modifiers |= modifiers;
+            self.latched_layer = Some(self.keymap.get_activated_layer());
+            self.publish_modifier_ui_state();
+        }
+        match key {
+            KeyCode::Hid(hid) => self.process_action_key(hid, event).await,
+            KeyCode::Consumer(consumer) => {
+                self.process_action_consumer_control(consumer, event).await;
+            }
+            KeyCode::SystemControl(system_control) => {
+                self.process_action_system_control(system_control, event).await;
+            }
+            _ => warn!("LatchTap key not supported: {:?}", key),
+        }
+    }
+
+    /// Release any latched `LatchTap` modifier whose layer is no longer active.
+    async fn cleanup_latch_tap(&mut self) {
+        if let Some(layer) = self.latched_layer {
+            if !self.keymap.is_layer_active(layer) {
+                self.latched_modifiers = ModifierCombination::default();
+                self.latched_layer = None;
+                self.send_keyboard_report_with_resolved_modifiers(false).await;
+            }
         }
     }
 
@@ -1798,8 +1894,32 @@ impl<'a> Keyboard<'a> {
         }))
         .await;
 
+        // Displays subscribe to ModifierEvent; include OSM + LatchTap, not only
+        // physically held modifiers (those alone miss one-shot / latched state).
+        self.publish_modifier_ui_state();
+
         // Yield once after sending the report to channel
         yield_now().await;
+    }
+
+    /// Modifiers that should light UI chips: held keys, LatchTap latch, and any
+    /// active one-shot (Initial / Single / Held). Differs from
+    /// [`resolve_explicit_modifiers`] on key-*release* with OSM in `Single`
+    /// state, where HID drops the one-shot from the release report but the
+    /// one-shot is still armed for the next key.
+    fn current_ui_modifiers(&self) -> ModifierCombination {
+        let mut result = self.held_modifiers | self.latched_modifiers;
+        if let Some(osm) = self.osm_state.value() {
+            result |= *osm;
+        }
+        result
+    }
+
+    /// Notify display/UI subscribers of the current modifier set (held + OSM + LatchTap).
+    pub(crate) fn publish_modifier_ui_state(&self) {
+        publish_event(ModifierEvent {
+            modifier: self.current_ui_modifiers(),
+        });
     }
 
     /// Send system control report if needed
@@ -1895,10 +2015,7 @@ impl<'a> Keyboard<'a> {
     /// Register a modifier to be sent in hid report.
     fn register_modifier_key(&mut self, key: HidKeyCode) {
         self.held_modifiers |= key.to_hid_modifiers();
-
-        publish_event(ModifierEvent {
-            modifier: self.held_modifiers,
-        });
+        self.publish_modifier_ui_state();
 
         // if a modifier key arrives after fork activation, it should be kept
         self.fork_keep_mask |= key.to_hid_modifiers();
@@ -1907,19 +2024,13 @@ impl<'a> Keyboard<'a> {
     /// Unregister a modifier from hid report.
     fn unregister_modifier_key(&mut self, key: HidKeyCode) {
         self.held_modifiers &= !key.to_hid_modifiers();
-
-        publish_event(ModifierEvent {
-            modifier: self.held_modifiers,
-        });
+        self.publish_modifier_ui_state();
     }
 
     /// Register a modifier combination to be sent in hid report.
     fn register_modifiers(&mut self, modifiers: ModifierCombination) {
         self.held_modifiers |= modifiers;
-
-        publish_event(ModifierEvent {
-            modifier: self.held_modifiers,
-        });
+        self.publish_modifier_ui_state();
 
         // if a modifier key arrives after fork activation, it should be kept
         self.fork_keep_mask |= modifiers;
@@ -1928,10 +2039,7 @@ impl<'a> Keyboard<'a> {
     /// Unregister a modifier combination from hid report.
     fn unregister_modifiers(&mut self, modifiers: ModifierCombination) {
         self.held_modifiers &= !modifiers;
-
-        publish_event(ModifierEvent {
-            modifier: self.held_modifiers,
-        });
+        self.publish_modifier_ui_state();
     }
 }
 

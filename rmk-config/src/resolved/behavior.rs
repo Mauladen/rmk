@@ -35,6 +35,7 @@ pub const AUTO_MOUSE_LAYER_MAX_NUM: usize = 4;
 pub struct OneShot {
     pub activate_on_keypress: Option<bool>,
     pub quick_release: Option<bool>,
+    pub cancel_ossm_on_layer_enter: Option<bool>,
 }
 
 pub struct Combos {
@@ -128,6 +129,7 @@ impl crate::KeyboardTomlConfig {
         let one_shot_modifiers = toml_behavior.one_shot_modifiers.map(|o| OneShot {
             activate_on_keypress: o.activate_on_keypress,
             quick_release: o.quick_release,
+            cancel_ossm_on_layer_enter: o.cancel_ossm_on_layer_enter,
         });
 
         let combos = toml_behavior.combo.map(|c| Combos {

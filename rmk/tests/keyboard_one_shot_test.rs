@@ -8,7 +8,7 @@ mod one_shot_test {
     use rmk::config::{OneShotConfig, PositionalConfig};
     use rmk::keyboard::Keyboard;
     use rmk::types::action::KeyAction;
-    use rmk::{k, osl, osm, th, wm};
+    use rmk::{a, k, mo, osl, osm, th, wm};
 
     use super::*;
     use crate::common::{KC_LCTRL, KC_LGUI, KC_LSHIFT, wrap_keymap};
@@ -389,6 +389,42 @@ mod one_shot_test {
         };
     }
 
+    /// OSM Test Case: cancel_ossm_on_layer_enter
+    ///
+    /// Config:
+    /// - timeout: 100ms
+    /// - cancel_ossm_on_layer_enter: true
+    ///
+    /// Sequence:
+    /// - Press and Release OSM LShift
+    /// - Press and Release OSL(1) (a layer key)
+    /// - Press and Release A (which on layer 1 is C)
+    ///
+    /// Expected:
+    /// - Entering the layer cancels the active one-shot modifier,
+    ///   so C is sent without LShift.
+    #[test]
+    fn test_osm_release_modifiers_keys() {
+        key_sequence_test! {
+            keyboard: create_test_keyboard_with_one_shot_modifiers_config(OneShotModifiersConfig {
+                cancel_ossm_on_layer_enter: true,
+                ..OneShotModifiersConfig::default()
+            }),
+            sequence: [
+                [0, 0, true, 10],   // Press OSM LShift
+                [0, 0, false, 10],  // Release OSM LShift
+                [0, 1, true, 10],   // Press OSL(1) - layer key cancels OSM
+                [0, 1, false, 10],  // Release OSL(1)
+                [0, 2, true, 10],   // Press A -> C on layer 1
+                [0, 2, false, 10],  // Release A
+            ],
+            expected_reports: [
+                [0, [kc_to_u8!(C), 0, 0, 0, 0, 0]], // C without LShift (OSM released)
+                [0, [0, 0, 0, 0, 0, 0]], // All released
+            ]
+        }
+    }
+
     // OSL Tests
     #[test]
     fn test_osl_basic_single_behavior() {
@@ -751,6 +787,124 @@ mod one_shot_test {
                 [KC_LSHIFT | KC_LCTRL, [0, 0, 0, 0, 0, 0]], // LCtrl added
                 [KC_LSHIFT | KC_LCTRL, [kc_to_u8!(A), 0, 0, 0, 0, 0]], // A with LShift+LCtrl
                 [0, [kc_to_u8!(A), 0, 0, 0, 0, 0]], // Quick-release: modifiers removed
+                [0, [0, 0, 0, 0, 0, 0]], // All released
+            ]
+        };
+    }
+
+    // MO + OSM layer-cancel tests
+    //
+    // KEYMAP
+    // Layer 0: MO(1)              A              B
+    // Layer 1: Transparent        OSM(LShift)    OSM(LCtrl)
+    //
+    // Config:
+    // - activate_on_keypress: true
+    // - cancel_ossm_on_layer_enter: true
+
+    const MO_OSM_KEYMAP: [[[KeyAction; 3]; 1]; 2] = [
+        [[
+            // Layer 0
+            mo!(1), // MO(1)
+            k!(A),  // A
+            k!(B),  // B
+        ]],
+        [[
+            // Layer 1
+            a!(Transparent), // Falls through to MO(1) on layer 0
+            osm!(ModifierCombination::new_from(false, false, false, true, false)), // OSM LShift
+            osm!(ModifierCombination::new_from(false, false, false, false, true)), // OSM LCtrl
+        ]],
+    ];
+
+    fn create_mo_osm_keyboard() -> Keyboard<'static> {
+        let behavior_config: &'static mut BehaviorConfig = Box::leak(Box::new(BehaviorConfig {
+            one_shot_modifiers: OneShotModifiersConfig {
+                activate_on_keypress: true,
+                cancel_ossm_on_layer_enter: true,
+                ..OneShotModifiersConfig::default()
+            },
+            ..BehaviorConfig::default()
+        }));
+        let per_key_config: &'static PositionalConfig<1, 3> = Box::leak(Box::new(PositionalConfig::default()));
+        Keyboard::new(wrap_keymap(MO_OSM_KEYMAP, per_key_config, behavior_config))
+    }
+
+    /// Hold MO(1), tap OSM(LShift), release MO(1), then tap A.
+    ///
+    /// The one-shot modifier is still active (it was set up after MO(1) was
+    /// *pressed*, so entering MO(1) did not cancel it), so A is sent with LShift
+    /// still applied.
+    #[test]
+    fn test_osm_release_key_mo_hold_then_tap_a() {
+        key_sequence_test! {
+            keyboard: create_mo_osm_keyboard(),
+            sequence: [
+                [0, 0, true, 10],   // Hold MO(1)
+                [0, 1, true, 10],   // Press OSM(LShift)
+                [0, 1, false, 10],  // Release OSM(LShift)
+                [0, 0, false, 10],  // Release MO(1)
+                [0, 1, true, 10],   // Press A (layer 0)
+                [0, 1, false, 10],  // Release A
+            ],
+            expected_reports: [
+                [KC_LSHIFT, [0, 0, 0, 0, 0, 0]], // LShift from OSM press
+                [KC_LSHIFT, [kc_to_u8!(A), 0, 0, 0, 0, 0]], // A with LShift
+                [0, [0, 0, 0, 0, 0, 0]], // All released
+            ]
+        };
+    }
+
+    /// Hold MO(1), hold OSM(LShift), release MO(1), release OSM(LShift), then tap A.
+    ///
+    /// MO(1) was entered before the OSM became active, so entering it does not
+    /// cancel the modifier. The modifier stays active and applies to A.
+    #[test]
+    fn test_osm_release_key_mo_release_before_osm() {
+        key_sequence_test! {
+            keyboard: create_mo_osm_keyboard(),
+            sequence: [
+                [0, 0, true, 10],   // Hold MO(1)
+                [0, 1, true, 10],   // Hold OSM(LShift)
+                [0, 0, false, 10],  // Release MO(1)
+                [0, 1, false, 10],  // Release OSM(LShift)
+                [0, 1, true, 10],   // Press A (layer 0)
+                [0, 1, false, 10],  // Release A
+            ],
+            expected_reports: [
+                [KC_LSHIFT, [0, 0, 0, 0, 0, 0]], // LShift pressed
+                [KC_LSHIFT, [kc_to_u8!(A), 0, 0, 0, 0, 0]], // LShift + A
+                [0, [0, 0, 0, 0, 0, 0]], // All released
+            ]
+        };
+    }
+
+    /// Hold MO(1), tap OSM(LShift), release MO(1), press MO(1) again (which enters
+    /// a layer while the OSM is still active and cancels the modifier),
+    /// release MO(1), then tap A.
+    ///
+    /// Expected:
+    /// - LShift is sent from the OSM press
+    /// - A is sent without LShift (modifier was cancelled by re-entering MO(1))
+    /// - All released
+    #[test]
+    fn test_osm_release_key_mo_press_again_releases() {
+        key_sequence_test! {
+            keyboard: create_mo_osm_keyboard(),
+            sequence: [
+                [0, 0, true, 10],   // Hold MO(1)
+                [0, 1, true, 10],   // Press OSM(LShift)
+                [0, 1, false, 10],  // Release OSM(LShift)
+                [0, 0, false, 10],  // Release MO(1)
+                [0, 0, true, 10],   // Press MO(1) again -> cancels active LShift
+                [0, 0, false, 10],  // Release MO(1)
+                [0, 1, true, 10],   // Press A (layer 0)
+                [0, 1, false, 10],  // Release A
+            ],
+            expected_reports: [
+                [KC_LSHIFT, [0, 0, 0, 0, 0, 0]], // LShift from OSM press
+                [0, [0, 0, 0, 0, 0, 0]], // All released
+                [0, [kc_to_u8!(A), 0, 0, 0, 0, 0]], // A without LShift (cancelled)
                 [0, [0, 0, 0, 0, 0, 0]], // All released
             ]
         };

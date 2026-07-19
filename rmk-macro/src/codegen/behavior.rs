@@ -52,11 +52,16 @@ fn expand_one_shot_modifiers(one_shot_modifiers: &Option<OneShot>) -> proc_macro
                 Some(value) => quote! { quick_release: #value, },
                 None => quote! {},
             };
+            let cancel_ossm_on_layer_enter = match one_shot_modifier.cancel_ossm_on_layer_enter {
+                Some(value) => quote! { cancel_ossm_on_layer_enter: #value, },
+                None => quote! {},
+            };
 
             quote! {
                 ::rmk::config::OneShotModifiersConfig {
                     #activate_on_keypress
                     #quick_release
+                    #cancel_ossm_on_layer_enter
                     ..Default::default()
                 }
             }

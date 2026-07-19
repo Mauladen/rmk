@@ -688,6 +688,7 @@ pub(crate) struct OneShotConfig {
 pub struct OneShotModifiersConfig {
     pub activate_on_keypress: Option<bool>,
     pub quick_release: Option<bool>,
+    pub cancel_ossm_on_layer_enter: Option<bool>,
 }
 
 /// Configurations for combos
