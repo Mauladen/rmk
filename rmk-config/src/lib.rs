@@ -197,6 +197,11 @@ impl KeyboardTomlConfig {
                 // Update the morse_max_num
                 self.rmk.morse_max_num = self.rmk.morse_max_num.max(morses.len());
             }
+
+            let auto_mouse_layers = behavior.auto_mouse_layer.as_deref().unwrap_or_default();
+            self.rmk.auto_mouse_layer_max_num.get_or_insert(auto_mouse_layers.len());
+        } else {
+            self.rmk.auto_mouse_layer_max_num.get_or_insert(0);
         }
     }
 }
@@ -263,6 +268,9 @@ pub(crate) struct RmkConstantsConfig {
     /// Smaller values reduce firmware RAM usage but require more round-trips.
     #[serde_inline_default(64)]
     pub protocol_macro_chunk_size: usize,
+    /// Maximum number of auto mouse layer entries; auto-derived from `[[behavior.auto_mouse_layer]]` if unset.
+    #[serde(default)]
+    pub auto_mouse_layer_max_num: Option<usize>,
 }
 
 fn check_combo_max_num<'de, D>(deserializer: D) -> Result<usize, D::Error>
@@ -330,6 +338,7 @@ impl Default for RmkConstantsConfig {
             split_central_sleep_timeout_seconds: 0,
             protocol_max_bulk_size: 8,
             protocol_macro_chunk_size: 64,
+            auto_mouse_layer_max_num: None,
         }
     }
 }
@@ -642,6 +651,15 @@ pub(crate) struct AutoMouseLayerConfig {
     /// Minimum absolute axis delta required to be considered as motion.
     /// Defaults to `1` (any motion). Helpful to filter out sensor noise.
     pub threshold: Option<u16>,
+    /// When `true`, non-mouse key presses deactivate `target_layer` immediately (mouse HID keys and `extra_mouse_keys` excepted).
+    /// Macro-emitted keycodes, `Again`/`Repeat`, and `GraveEscape` cannot be classified and never deactivate the layer.
+    pub deactivate_on_key: Option<bool>,
+    /// Extra keycodes (e.g. modifiers) that do not trigger deactivation when `deactivate_on_key` is set.
+    /// Modifier keycodes listed here also exempt modifier-only actions containing them.
+    pub extra_mouse_keys: Option<Vec<String>>,
+    /// When `true`, key presses that do NOT deactivate `target_layer` extend the timeout deadline
+    /// (i.e. reset it to now + `timeout`) at the moment the key's action resolves.
+    pub reset_timeout_on_key: Option<bool>,
 }
 
 /// Per Key configurations profiles for morse, tap-hold, etc.
